@@ -66,3 +66,9 @@ pub enum CompileError {
     #[fail(display = "Compilation error: {}", _0)]
     Codegen(CodegenError),
 }
+
+/// Single address point transform.
+pub type AddressTransform = (ir::SourceLoc, u64);
+
+/// Function AddressTransforms collection.
+pub type AddressTransforms = PrimaryMap<DefinedFuncIndex, Vec<AddressTransform>>;

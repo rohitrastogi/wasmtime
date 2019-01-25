@@ -11,14 +11,17 @@ use core::cell::RefCell;
 use cranelift_entity::{BoxedSlice, PrimaryMap};
 use cranelift_wasm::{DefinedFuncIndex, SignatureIndex};
 use std::boxed::Box;
+use std::io::Write;
 use std::rc::Rc;
 use std::string::String;
 use std::vec::Vec;
+use wasmtime_debug::read_debuginfo;
 use wasmtime_environ::{
     CompileError, DataInitializer, DataInitializerLocation, Module, ModuleEnvironment,
 };
 use wasmtime_runtime::{
-    Export, Imports, Instance, InstantiationError, VMFunctionBody, VMSharedSignatureIndex,
+    Export, GdbJitImageRegistration, Imports, Instance, InstantiationError, VMFunctionBody,
+    VMSharedSignatureIndex,
 };
 
 /// An error condition while setting up a wasm instance, be it validation,
@@ -47,6 +50,7 @@ struct RawCompiledModule<'data> {
     imports: Imports,
     data_initializers: Box<[DataInitializer<'data>]>,
     signatures: BoxedSlice<SignatureIndex, VMSharedSignatureIndex>,
+    dbg_jit_registration: Option<GdbJitImageRegistration>,
 }
 
 impl<'data> RawCompiledModule<'data> {
@@ -55,6 +59,7 @@ impl<'data> RawCompiledModule<'data> {
         compiler: &mut Compiler,
         data: &'data [u8],
         resolver: &mut dyn Resolver,
+        debug_info: bool,
     ) -> Result<Self, SetupError> {
         let environ = ModuleEnvironment::new(compiler.frontend_config(), compiler.tunables());
 
@@ -62,8 +67,17 @@ impl<'data> RawCompiledModule<'data> {
             .translate(data)
             .map_err(|error| SetupError::Compile(CompileError::Wasm(error)))?;
 
-        let (allocated_functions, relocations) =
-            compiler.compile(&translation.module, translation.function_body_inputs)?;
+        let debug_data = if debug_info {
+            Some(read_debuginfo(&data))
+        } else {
+            None
+        };
+
+        let (allocated_functions, relocations, dbg_image) = compiler.compile(
+            &translation.module,
+            translation.function_body_inputs,
+            debug_data,
+        )?;
 
         let imports = link_module(
             &translation.module,
@@ -97,12 +111,22 @@ impl<'data> RawCompiledModule<'data> {
         // Make all code compiled thus far executable.
         compiler.publish_compiled_code();
 
+        let dbg_jit_registration = if let Some(img) = dbg_image {
+            let mut bytes = Vec::new();
+            bytes.write_all(&img).expect("all written");
+            let reg = GdbJitImageRegistration::register(bytes);
+            Some(reg)
+        } else {
+            None
+        };
+
         Ok(Self {
             module: translation.module,
             finished_functions,
             imports,
             data_initializers: translation.data_initializers.into_boxed_slice(),
             signatures: signatures.into_boxed_slice(),
+            dbg_jit_registration,
         })
     }
 }
@@ -115,6 +139,7 @@ pub struct CompiledModule {
     data_initializers: Box<[OwnedDataInitializer]>,
     signatures: BoxedSlice<SignatureIndex, VMSharedSignatureIndex>,
     global_exports: Rc<RefCell<HashMap<String, Option<Export>>>>,
+    dbg_jit_registration: Option<Rc<GdbJitImageRegistration>>,
 }
 
 impl CompiledModule {
@@ -124,8 +149,9 @@ impl CompiledModule {
         data: &'data [u8],
         resolver: &mut dyn Resolver,
         global_exports: Rc<RefCell<HashMap<String, Option<Export>>>>,
+        debug_info: bool,
     ) -> Result<Self, SetupError> {
-        let raw = RawCompiledModule::<'data>::new(compiler, data, resolver)?;
+        let raw = RawCompiledModule::<'data>::new(compiler, data, resolver, debug_info)?;
 
         Ok(Self::from_parts(
             raw.module,
@@ -138,6 +164,7 @@ impl CompiledModule {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             raw.signatures.clone(),
+            raw.dbg_jit_registration,
         ))
     }
 
@@ -149,6 +176,7 @@ impl CompiledModule {
         imports: Imports,
         data_initializers: Box<[OwnedDataInitializer]>,
         signatures: BoxedSlice<SignatureIndex, VMSharedSignatureIndex>,
+        dbg_jit_registration: Option<GdbJitImageRegistration>,
     ) -> Self {
         Self {
             module: Rc::new(module),
@@ -157,6 +185,7 @@ impl CompiledModule {
             imports,
             data_initializers,
             signatures,
+            dbg_jit_registration: dbg_jit_registration.map(|r| Rc::new(r)),
         }
     }
 
@@ -181,6 +210,7 @@ impl CompiledModule {
             self.imports.clone(),
             &data_initializers,
             self.signatures.clone(),
+            self.dbg_jit_registration.as_ref().map(|r| Rc::clone(&r)),
             Box::new(()),
         )
     }
@@ -214,8 +244,9 @@ pub fn instantiate(
     data: &[u8],
     resolver: &mut dyn Resolver,
     global_exports: Rc<RefCell<HashMap<String, Option<Export>>>>,
+    debug_info: bool,
 ) -> Result<Instance, SetupError> {
-    let raw = RawCompiledModule::new(compiler, data, resolver)?;
+    let raw = RawCompiledModule::new(compiler, data, resolver, debug_info)?;
 
     Instance::new(
         Rc::new(raw.module),
@@ -224,6 +255,7 @@ pub fn instantiate(
         raw.imports,
         &*raw.data_initializers,
         raw.signatures,
+        raw.dbg_jit_registration.map(|r| Rc::new(r)),
         Box::new(()),
     )
     .map_err(SetupError::Instantiate)

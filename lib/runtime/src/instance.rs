@@ -3,6 +3,7 @@
 
 use crate::export::Export;
 use crate::imports::Imports;
+use crate::jit_int::GdbJitImageRegistration;
 use crate::memory::LinearMemory;
 use crate::mmap::Mmap;
 use crate::signalhandlers::{wasmtime_init_eager, wasmtime_init_finish};
@@ -203,6 +204,9 @@ pub struct InstanceContents {
 
     /// Hosts can store arbitrary per-instance information here.
     host_state: Box<dyn Any>,
+
+    /// Optional image of JIT'ed code for debugger registration.
+    dbg_jit_registration: Option<Rc<GdbJitImageRegistration>>,
 
     /// Context pointer used by compiled wasm code. This field is last, and
     /// represents a dynamically-sized array that extends beyond the nominal
@@ -600,6 +604,7 @@ impl Instance {
         imports: Imports,
         data_initializers: &[DataInitializer<'_>],
         vmshared_signatures: BoxedSlice<SignatureIndex, VMSharedSignatureIndex>,
+        dbg_jit_registration: Option<Rc<GdbJitImageRegistration>>,
         host_state: Box<dyn Any>,
     ) -> Result<Self, InstantiationError> {
         let mut tables = create_tables(&module);
@@ -637,6 +642,7 @@ impl Instance {
                 memories,
                 tables,
                 finished_functions,
+                dbg_jit_registration,
                 host_state,
                 vmctx: VMContext {},
             };

@@ -1,6 +1,9 @@
 //! Support for compiling with Cranelift.
 
-use crate::compilation::{Compilation, CompileError, Relocation, RelocationTarget, Relocations};
+use crate::compilation::{
+    AddressTransform, AddressTransforms, Compilation, CompileError, Relocation, RelocationTarget,
+    Relocations,
+};
 use crate::func_environ::{
     get_func_name, get_imported_memory32_grow_name, get_imported_memory32_size_name,
     get_memory32_grow_name, get_memory32_size_name, FuncEnvironment,
@@ -80,15 +83,39 @@ impl RelocSink {
     }
 }
 
+fn get_address_transform(context: &Context, isa: &isa::TargetIsa) -> Vec<AddressTransform> {
+    let mut result = Vec::new();
+
+    let func = &context.func;
+    let mut ebbs = func.layout.ebbs().collect::<Vec<_>>();
+    ebbs.sort_by_key(|ebb| func.offsets[*ebb]); // Ensure inst offsets always increase
+
+    let encinfo = isa.encoding_info();
+    for ebb in ebbs {
+        for (offset, inst, _size) in func.inst_offsets(ebb, &encinfo) {
+            let srcloc = func.srclocs[inst];
+            let address_offset = offset as u64;
+            result.push((srcloc, address_offset));
+        }
+    }
+    result
+}
+
+fn align_code_buf(buf: &mut Vec<u8>) {
+    let new_len = buf.len() + (!buf.len() + 1) % 16;
+    buf.resize(new_len, /* fill = */ 0xCC);
+}
+
 /// Compile the module using Cranelift, producing a compilation result with
 /// associated relocations.
 pub fn compile_module<'data, 'module>(
     module: &'module Module,
     function_body_inputs: PrimaryMap<DefinedFuncIndex, &'data [u8]>,
     isa: &dyn isa::TargetIsa,
-) -> Result<(Compilation, Relocations), CompileError> {
+) -> Result<(Compilation, Relocations, AddressTransforms), CompileError> {
     let mut functions = PrimaryMap::new();
     let mut relocations = PrimaryMap::new();
+    let mut address_transforms = PrimaryMap::new();
     for (i, input) in function_body_inputs.into_iter() {
         let func_index = module.func_index(i);
         let mut context = Context::new();
@@ -110,10 +137,16 @@ pub fn compile_module<'data, 'module>(
         context
             .compile_and_emit(isa, &mut code_buf, &mut reloc_sink, &mut trap_sink)
             .map_err(CompileError::Codegen)?;
+
+        align_code_buf(&mut code_buf);
+
+        let at = get_address_transform(&context, isa);
+
         functions.push(code_buf);
         relocations.push(reloc_sink.func_relocs);
+        address_transforms.push(at);
     }
 
     // TODO: Reorganize where we create the Vec for the resolved imports.
-    Ok((Compilation::new(functions), relocations))
+    Ok((Compilation::new(functions), relocations, address_transforms))
 }
